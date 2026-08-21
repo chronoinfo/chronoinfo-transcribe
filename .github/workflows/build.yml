@@ -1,0 +1,37 @@
+# Build the transcription image and publish it to GHCR.
+#
+# Railway on Tyler's account deploys from images (his n8n runs the pinned
+# n8nio/n8n image the same way), and connecting Railway to GitHub needs a
+# browser OAuth flow. Publishing an image sidesteps that entirely: Railway
+# pulls a public GHCR image with no GitHub connection at all.
+name: build image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          # The Whisper weights are baked in at build time, so the image is
+          # large but a cold container never blocks a webhook on a download.
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
