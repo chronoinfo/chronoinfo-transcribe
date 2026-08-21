@@ -23,7 +23,7 @@ GET /health -> { ok, model, dtype, ready, warmedAt }
 |---|---|
 | `TRANSCRIBE_SECRET` | Shared secret, sent as `x-auth`. Required in production |
 | `CLOSE_API_KEY` | So the service can pull recordings from Close itself |
-| `WHISPER_MODEL` | Default `onnx-community/whisper-base.en` |
+| `WHISPER_MODEL` | Default `onnx-community/distil-small.en` |
 | `WHISPER_DTYPE` | Default `q8` — quantised, much smaller and faster, negligible loss on speech |
 | `MAX_AUDIO_SECONDS` | Default 5400 (90 min) |
 

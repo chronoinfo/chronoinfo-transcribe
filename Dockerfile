@@ -5,10 +5,14 @@ FROM node:22-slim
 
 WORKDIR /app
 ENV NODE_ENV=production
-# base.en, not small.en: Railway Hobby caps this container at 1 GB and
-# small.en peaked at 1.22 GB mid-inference and was OOM-killed (measured
-# 2026-08-21). base.en fits comfortably and still transcribes ~6x realtime.
-ENV WHISPER_MODEL=onnx-community/whisper-base.en
+# distil-small.en, chosen by measurement on the real Close recording:
+#   tiny.en   532MB  -> "I'll look. I'll look."        (hallucinated)
+#   base.en   695MB  -> "All of them... a circle. OK."  (hallucinated)
+#   distil-sm 923MB  -> "Hello. Okay."                  <- agrees with small
+#   small.en 1220MB  -> "Hello. Hello."                 (502s on this container)
+# The small models each invent something different on quiet audio; the two
+# largest agree. distil-small is the most accurate that actually runs here.
+ENV WHISPER_MODEL=onnx-community/distil-small.en
 ENV WHISPER_DTYPE=q8
 # transformers.js caches under HF_HOME; keep it inside the image layer.
 ENV HF_HOME=/app/.cache
