@@ -21,7 +21,7 @@ import { pipeline } from '@huggingface/transformers';
 const PORT = Number(process.env.PORT || 3000);
 const SECRET = process.env.TRANSCRIBE_SECRET || '';
 const CLOSE_KEY = process.env.CLOSE_API_KEY || '';
-const MODEL = process.env.WHISPER_MODEL || 'onnx-community/whisper-small.en';
+const MODEL = process.env.WHISPER_MODEL || 'onnx-community/whisper-base.en';
 const DTYPE = process.env.WHISPER_DTYPE || 'q8';
 const MAX_SECONDS = Number(process.env.MAX_AUDIO_SECONDS || 5400); // 90 min
 

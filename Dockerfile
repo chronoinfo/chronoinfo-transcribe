@@ -5,7 +5,10 @@ FROM node:22-slim
 
 WORKDIR /app
 ENV NODE_ENV=production
-ENV WHISPER_MODEL=onnx-community/whisper-small.en
+# base.en, not small.en: Railway Hobby caps this container at 1 GB and
+# small.en peaked at 1.22 GB mid-inference and was OOM-killed (measured
+# 2026-08-21). base.en fits comfortably and still transcribes ~6x realtime.
+ENV WHISPER_MODEL=onnx-community/whisper-base.en
 ENV WHISPER_DTYPE=q8
 # transformers.js caches under HF_HOME; keep it inside the image layer.
 ENV HF_HOME=/app/.cache
