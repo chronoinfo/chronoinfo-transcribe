@@ -1,0 +1,16 @@
+{
+  "name": "chronoinfo-transcribe",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Open-source speech-to-text for Chrono Info call recordings. Whisper (ONNX) on Tyler's own Railway.",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.mjs",
+    "warm": "node warm.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "mpg123-decoder": "^1.0.3"
+  }
+}

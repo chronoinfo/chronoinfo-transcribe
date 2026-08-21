@@ -1,0 +1,167 @@
+// Chrono Info — transcription service
+//
+// Turns a Close call recording into text, using Whisper (open weights, ONNX
+// runtime) entirely on Tyler's own Railway. No third-party speech API, no
+// per-minute vendor cost, nothing leaves his infrastructure.
+//
+//   POST /transcribe   { "callId": "acti_..." }  or  { "url": "https://..." }
+//   Header             x-auth: <TRANSCRIBE_SECRET>
+//   -> 200 { text, seconds, model, chars, tookMs }
+//
+//   GET  /health       -> { ok, model, dtype, ready, warmedAt }
+//
+// Why the audio is decoded in JS rather than with ffmpeg: the container stays
+// small and dependency-free. mpg123-decoder is a WASM MP3 decoder, so there is
+// no system audio binary to install or keep patched.
+
+import http from 'node:http';
+import { MPEGDecoder } from 'mpg123-decoder';
+import { pipeline } from '@huggingface/transformers';
+
+const PORT = Number(process.env.PORT || 3000);
+const SECRET = process.env.TRANSCRIBE_SECRET || '';
+const CLOSE_KEY = process.env.CLOSE_API_KEY || '';
+const MODEL = process.env.WHISPER_MODEL || 'onnx-community/whisper-small.en';
+const DTYPE = process.env.WHISPER_DTYPE || 'q8';
+const MAX_SECONDS = Number(process.env.MAX_AUDIO_SECONDS || 5400); // 90 min
+
+const closeAuth = CLOSE_KEY ? 'Basic ' + Buffer.from(CLOSE_KEY + ':').toString('base64') : '';
+
+let asr = null;
+let warmedAt = null;
+let loading = null;
+
+// One shared model instance. Loading is idempotent and concurrent callers wait
+// on the same promise rather than each pulling their own copy into memory.
+function getModel() {
+  if (asr) return Promise.resolve(asr);
+  if (!loading) {
+    loading = pipeline('automatic-speech-recognition', MODEL, { dtype: DTYPE })
+      .then((p) => { asr = p; warmedAt = new Date().toISOString(); return p; })
+      .catch((e) => { loading = null; throw e; });
+  }
+  return loading;
+}
+
+async function fetchAudio(url) {
+  const headers = {};
+  // Close recording URLs need the API key; anything else is fetched plain.
+  if (closeAuth && /(^|\.)close\.com\//.test(url)) headers.Authorization = closeAuth;
+  const r = await fetch(url, { headers, redirect: 'follow' });
+  if (!r.ok) throw new Error('recording fetch failed: ' + r.status);
+  return Buffer.from(await r.arrayBuffer());
+}
+
+// mp3 -> mono Float32 at 16kHz, the only shape Whisper accepts.
+async function toPcm16k(buf) {
+  const dec = new MPEGDecoder();
+  await dec.ready;
+  let decoded;
+  try {
+    decoded = dec.decode(new Uint8Array(buf));
+  } finally {
+    dec.free();
+  }
+  const { channelData, sampleRate } = decoded;
+  if (!channelData || !channelData.length || !channelData[0].length) {
+    throw new Error('no audio decoded — not an mp3, or empty recording');
+  }
+  const mono = channelData.length > 1
+    ? Float32Array.from(channelData[0], (v, i) => (v + channelData[1][i]) / 2)
+    : channelData[0];
+
+  if (sampleRate === 16000) return { pcm: mono, seconds: mono.length / 16000 };
+
+  // Linear decimation is enough here: the source is 8-22kHz phone audio, and
+  // Whisper's own front end is far more forgiving than the sample rate.
+  const ratio = sampleRate / 16000;
+  const out = new Float32Array(Math.floor(mono.length / ratio));
+  for (let i = 0; i < out.length; i++) out[i] = mono[Math.floor(i * ratio)];
+  return { pcm: out, seconds: out.length / 16000 };
+}
+
+function send(res, code, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > 2 * 1024 * 1024) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')); }
+      catch (e) { reject(new Error('bad json')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
+
+  if (req.method === 'GET' && url.pathname === '/health') {
+    return send(res, 200, { ok: true, model: MODEL, dtype: DTYPE, ready: !!asr, warmedAt });
+  }
+
+  if (req.method !== 'POST' || url.pathname !== '/transcribe') {
+    return send(res, 404, { error: 'not found' });
+  }
+
+  if (SECRET && req.headers['x-auth'] !== SECRET) {
+    return send(res, 401, { error: 'unauthorized' });
+  }
+
+  const started = Date.now();
+  try {
+    const body = await readBody(req);
+    const target = body.url
+      || (body.callId ? 'https://api.close.com/call/' + encodeURIComponent(body.callId) + '/recording/' : '');
+    if (!target) return send(res, 400, { error: 'callId or url required' });
+
+    const audio = await fetchAudio(target);
+    const { pcm, seconds } = await toPcm16k(audio);
+
+    if (seconds > MAX_SECONDS) {
+      return send(res, 413, { error: 'recording too long', seconds, max: MAX_SECONDS });
+    }
+    // A ring with no conversation is not worth a model pass.
+    if (seconds < 1.5) {
+      return send(res, 200, { text: '', seconds, model: MODEL, chars: 0, skipped: 'too short' });
+    }
+
+    const model = await getModel();
+    const out = await model(pcm, { chunk_length_s: 30, stride_length_s: 5 });
+    const text = String((out && out.text) || '').trim();
+
+    return send(res, 200, {
+      text,
+      seconds: Math.round(seconds * 10) / 10,
+      model: MODEL,
+      chars: text.length,
+      tookMs: Date.now() - started,
+    });
+  } catch (e) {
+    const msg = String((e && e.message) || e).slice(0, 300);
+    console.error('transcribe failed:', msg);
+    return send(res, 500, { error: msg, tookMs: Date.now() - started });
+  }
+});
+
+// Long recordings take minutes; don't let the platform hang up mid-pass.
+server.requestTimeout = 0;
+server.headersTimeout = 0;
+server.timeout = 0;
+server.keepAliveTimeout = 65000;
+
+server.listen(PORT, () => {
+  console.log('transcribe listening on ' + PORT + ' · model ' + MODEL + ' (' + DTYPE + ')');
+  // Load the model at boot so the first real call isn't the one that pays for it.
+  getModel().then(() => console.log('model ready')).catch((e) => console.error('warm failed:', e.message));
+});
