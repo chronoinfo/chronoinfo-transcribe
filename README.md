@@ -46,3 +46,17 @@ transcribes in about two minutes.
 
 Transfers to Tyler with the rest of the stack. It is deliberately a separate service
 on **his** Railway project, alongside his n8n, so handover stays a no-op.
+
+---
+
+## Documentation
+
+This service is one piece of the Chrono Info stack. Everything else about that stack —
+Close, Airtable, the n8n workflows, the portal, tracking, the decision register, the rep
+guides and the credentials inventory — lives in the **`chronoinfo-portal`** repository:
+
+- `HANDOVER.md` — start here
+- `docs/` — the full documentation set
+
+The transcription service feeds the AI post-call prefill; see `docs/02-systems/portal.md`
+in that repo for how the two connect.
