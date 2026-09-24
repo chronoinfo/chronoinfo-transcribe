@@ -22,6 +22,12 @@
 //   and the caller (an n8n Code task) is itself killed at 300 seconds. Start,
 //   then poll, is the only shape that works for long recordings.
 //
+//   Add "timestamps": true to either form to also get
+//   segments: [[startSeconds, text], ...]  — Whisper's own segment times, from
+//   the start of the recording. Used by the portal's Setter Review so a manager
+//   can click from the AI's read straight to the moment (2026-09-24). Off by
+//   default: callers that only want text (W16) are unchanged.
+//
 //   GET  /health       -> { ok, model, dtype, ready, warmedAt, jobs }
 //
 // Why the audio is decoded in JS rather than with ffmpeg: the container stays
@@ -104,7 +110,21 @@ function pruneJobs() {
   for (const [id, j] of jobs) if (j.createdAt < cutoff) jobs.delete(id);
 }
 
-async function transcribeTarget(target) {
+// Whisper's timestamped chunks -> [[startSeconds, text]], blanks dropped.
+function toSegments(out) {
+  return ((out && out.chunks) || [])
+    .map((c) => [Math.round(Number((c.timestamp || [])[0]) * 100) / 100, String(c.text || '').trim()])
+    .filter(([t, text]) => Number.isFinite(t) && text);
+}
+
+async function runModel(pcm, timestamps) {
+  const model = await getModel();
+  const out = await model(pcm, { chunk_length_s: 30, stride_length_s: 5, ...(timestamps ? { return_timestamps: true } : {}) });
+  const text = String((out && out.text) || '').trim();
+  return timestamps ? { text, segments: toSegments(out) } : { text };
+}
+
+async function transcribeTarget(target, timestamps = false) {
   const started = Date.now();
   const audio = await fetchAudio(target);
   const { pcm, seconds } = await toPcm16k(audio);
@@ -115,13 +135,11 @@ async function transcribeTarget(target) {
   if (seconds < 1.5) {
     return { text: '', seconds, model: MODEL, chars: 0, skipped: 'too short', tookMs: Date.now() - started };
   }
-  const model = await getModel();
-  const out = await model(pcm, { chunk_length_s: 30, stride_length_s: 5 });
-  const text = String((out && out.text) || '').trim();
-  return { text, seconds: Math.round(seconds * 10) / 10, model: MODEL, chars: text.length, tookMs: Date.now() - started };
+  const { text, segments } = await runModel(pcm, timestamps);
+  return { text, ...(segments ? { segments } : {}), seconds: Math.round(seconds * 10) / 10, model: MODEL, chars: text.length, tookMs: Date.now() - started };
 }
 
-function enqueueJob(target, callId) {
+function enqueueJob(target, callId, timestamps = false) {
   pruneJobs();
   const id = 'job_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
   const job = { jobId: id, status: 'queued', callId: callId || null, createdAt: Date.now(), startedAt: null, finishedAt: null, result: null, error: null };
@@ -130,7 +148,7 @@ function enqueueJob(target, callId) {
     job.status = 'running';
     job.startedAt = Date.now();
     try {
-      job.result = await transcribeTarget(target);
+      job.result = await transcribeTarget(target, timestamps);
       job.status = 'done';
     } catch (e) {
       job.status = 'error';
@@ -206,8 +224,9 @@ const server = http.createServer(async (req, res) => {
       || (body.callId ? 'https://api.close.com/call/' + encodeURIComponent(body.callId) + '/recording/' : '');
     if (!target) return send(res, 400, { error: 'callId or url required' });
 
+    const timestamps = body.timestamps === true || body.timestamps === 'true';
     if (body.async === true || body.async === 'true') {
-      return send(res, 202, publicJob(enqueueJob(target, body.callId || null)));
+      return send(res, 202, publicJob(enqueueJob(target, body.callId || null, timestamps)));
     }
 
     const audio = await fetchAudio(target);
@@ -221,12 +240,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { text: '', seconds, model: MODEL, chars: 0, skipped: 'too short' });
     }
 
-    const model = await getModel();
-    const out = await model(pcm, { chunk_length_s: 30, stride_length_s: 5 });
-    const text = String((out && out.text) || '').trim();
+    const { text, segments } = await runModel(pcm, timestamps);
 
     return send(res, 200, {
       text,
+      ...(segments ? { segments } : {}),
       seconds: Math.round(seconds * 10) / 10,
       model: MODEL,
       chars: text.length,
