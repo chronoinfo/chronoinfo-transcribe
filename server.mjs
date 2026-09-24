@@ -35,6 +35,8 @@
 // no system audio binary to install or keep patched.
 
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
 import { MPEGDecoder } from 'mpg123-decoder';
 import { pipeline } from '@huggingface/transformers';
 
@@ -44,6 +46,28 @@ const CLOSE_KEY = process.env.CLOSE_API_KEY || '';
 const MODEL = process.env.WHISPER_MODEL || 'onnx-community/distil-small.en';
 const DTYPE = process.env.WHISPER_DTYPE || 'q8';
 const MAX_SECONDS = Number(process.env.MAX_AUDIO_SECONDS || 5400); // 90 min
+
+// 🔴 THREADS = THE CONTAINER'S CPU QUOTA, never the host's core count.
+// onnxruntime sizes its thread pool from the cores it can SEE, and inside a
+// container that is the whole host. On Railway that put dozens of threads on an
+// 8-vCPU quota: CPU pinned at exactly 8.0, and Whisper ran at 2.4x real time
+// (a 6-minute call took 14 minutes) against 0.34x for the same model on a plain
+// 8-core machine. Measured 2026-09-24: 48 threads on 8 cores = 44.1s for a clip
+// that takes 6.6s with 8. Read the cgroup quota; WHISPER_THREADS overrides.
+function cpuQuota() {
+  try {
+    const [quota, period] = fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8').trim().split(/\s+/);
+    if (quota !== 'max' && Number(period) > 0) return Math.max(1, Math.floor(Number(quota) / Number(period)));
+  } catch { /* cgroup v1 or not a container */ }
+  try {
+    const q = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8'));
+    const pd = Number(fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8'));
+    if (q > 0 && pd > 0) return Math.max(1, Math.floor(q / pd));
+  } catch { /* no v1 quota either */ }
+  return null;
+}
+const HOST_CPUS = os.availableParallelism ? os.availableParallelism() : os.cpus().length;
+const THREADS = Number(process.env.WHISPER_THREADS) || Math.min(cpuQuota() || HOST_CPUS, HOST_CPUS);
 
 const closeAuth = CLOSE_KEY ? 'Basic ' + Buffer.from(CLOSE_KEY + ':').toString('base64') : '';
 
@@ -56,7 +80,10 @@ let loading = null;
 function getModel() {
   if (asr) return Promise.resolve(asr);
   if (!loading) {
-    loading = pipeline('automatic-speech-recognition', MODEL, { dtype: DTYPE })
+    loading = pipeline('automatic-speech-recognition', MODEL, {
+      dtype: DTYPE,
+      session_options: { intraOpNumThreads: THREADS, interOpNumThreads: 1 },
+    })
       .then((p) => { asr = p; warmedAt = new Date().toISOString(); return p; })
       .catch((e) => { loading = null; throw e; });
   }
@@ -206,7 +233,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    return send(res, 200, { ok: true, model: MODEL, dtype: DTYPE, ready: !!asr, warmedAt, jobs: jobs.size });
+    return send(res, 200, { ok: true, model: MODEL, dtype: DTYPE, threads: THREADS, hostCpus: HOST_CPUS, quota: cpuQuota(), ready: !!asr, warmedAt, jobs: jobs.size });
   }
 
   if (req.method !== 'POST' || url.pathname !== '/transcribe') {
